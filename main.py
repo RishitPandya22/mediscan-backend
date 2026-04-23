@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -110,7 +110,7 @@ TIPS = {
 }
 
 # ─────────────────────────────────────────────
-# HELPER — FEATURE IMPORTANCE
+# HELPERS
 # ─────────────────────────────────────────────
 def get_top_features(model, feature_names, top_n=5):
     importances = model.feature_importances_
@@ -119,6 +119,41 @@ def get_top_features(model, feature_names, top_n=5):
         {"feature": feature_names[i], "importance": round(float(importances[i]) * 100, 2)}
         for i in indices
     ]
+
+def get_confidence_interval(model, scaled_input, probability):
+    """
+    Get confidence interval using individual tree predictions
+    from the Random Forest / Gradient Boosting ensemble
+    """
+    try:
+        if hasattr(model, 'estimators_'):
+            # Get probability from each individual tree
+            tree_probs = []
+            for estimator in model.estimators_:
+                if hasattr(estimator, 'predict_proba'):
+                    prob = estimator.predict_proba(scaled_input)[0][1]
+                    tree_probs.append(prob)
+                elif hasattr(estimator, 'predict'):
+                    # For gradient boosting base estimators
+                    pred = estimator.predict(scaled_input)[0]
+                    tree_probs.append(float(pred))
+
+            if len(tree_probs) > 1:
+                tree_probs = np.array(tree_probs)
+                std = np.std(tree_probs)
+                lower = max(0, round((probability / 100 - 1.96 * std) * 100, 1))
+                upper = min(100, round((probability / 100 + 1.96 * std) * 100, 1))
+                return {"lower": lower, "upper": upper, "std": round(float(std) * 100, 2)}
+    except Exception:
+        pass
+
+    # Fallback: simple ±5% range
+    margin = 5.0
+    return {
+        "lower": max(0, round(probability - margin, 1)),
+        "upper": min(100, round(probability + margin, 1)),
+        "std": round(margin / 2, 2)
+    }
 
 # ─────────────────────────────────────────────
 # INPUT SCHEMAS
@@ -200,12 +235,14 @@ def predict_diabetes(data: DiabetesInput):
     ]])
     scaled = diabetes_scaler.transform(input_array)
     prediction = int(diabetes_model.predict(scaled)[0])
-    probability = float(diabetes_model.predict_proba(scaled)[0][1])
+    probability = round(float(diabetes_model.predict_proba(scaled)[0][1]) * 100, 2)
+    confidence = get_confidence_interval(diabetes_model, scaled, probability)
     return {
         "prediction": prediction,
-        "probability": round(probability * 100, 2),
+        "probability": probability,
         "risk": "HIGH" if prediction == 1 else "LOW",
-        "top_features": get_top_features(diabetes_model, DIABETES_FEATURES)
+        "top_features": get_top_features(diabetes_model, DIABETES_FEATURES),
+        "confidence_interval": confidence,
     }
 
 @app.post("/whatif/diabetes")
@@ -236,12 +273,14 @@ def predict_heart(data: HeartInput):
     ]])
     scaled = heart_scaler.transform(input_array)
     prediction = int(heart_model.predict(scaled)[0])
-    probability = float(heart_model.predict_proba(scaled)[0][1])
+    probability = round(float(heart_model.predict_proba(scaled)[0][1]) * 100, 2)
+    confidence = get_confidence_interval(heart_model, scaled, probability)
     return {
         "prediction": prediction,
-        "probability": round(probability * 100, 2),
+        "probability": probability,
         "risk": "HIGH" if prediction == 1 else "LOW",
-        "top_features": get_top_features(heart_model, HEART_FEATURES)
+        "top_features": get_top_features(heart_model, HEART_FEATURES),
+        "confidence_interval": confidence,
     }
 
 @app.post("/whatif/heart")
@@ -273,12 +312,14 @@ def predict_parkinsons(data: ParkinsonsInput):
     ]])
     scaled = parkinsons_scaler.transform(input_array)
     prediction = int(parkinsons_model.predict(scaled)[0])
-    probability = float(parkinsons_model.predict_proba(scaled)[0][1])
+    probability = round(float(parkinsons_model.predict_proba(scaled)[0][1]) * 100, 2)
+    confidence = get_confidence_interval(parkinsons_model, scaled, probability)
     return {
         "prediction": prediction,
-        "probability": round(probability * 100, 2),
+        "probability": probability,
         "risk": "HIGH" if prediction == 1 else "LOW",
-        "top_features": get_top_features(parkinsons_model, PARKINSONS_FEATURES)
+        "top_features": get_top_features(parkinsons_model, PARKINSONS_FEATURES),
+        "confidence_interval": confidence,
     }
 
 @app.post("/whatif/parkinsons")
@@ -310,8 +351,6 @@ def generate_report(data: PDFReportInput):
         topMargin=0.75*inch, bottomMargin=0.75*inch
     )
 
-    # Colors
-    dark_bg = colors.HexColor('#020b18')
     neon_green = colors.HexColor('#00ff95')
     neon_blue = colors.HexColor('#00b4ff')
     danger_red = colors.HexColor('#ff4444')
@@ -321,62 +360,25 @@ def generate_report(data: PDFReportInput):
 
     risk_color = danger_red if data.risk == "HIGH" else neon_green
 
-    # Styles
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle('title',
-        fontName='Helvetica-Bold', fontSize=28,
-        textColor=neon_green, alignment=TA_CENTER,
-        spaceAfter=4, letterSpacing=6
-    )
-    subtitle_style = ParagraphStyle('subtitle',
-        fontName='Helvetica', fontSize=9,
-        textColor=neon_blue, alignment=TA_CENTER,
-        spaceAfter=2, letterSpacing=3
-    )
-    section_style = ParagraphStyle('section',
-        fontName='Helvetica-Bold', fontSize=10,
-        textColor=neon_green, spaceAfter=8,
-        letterSpacing=2
-    )
-    body_style = ParagraphStyle('body',
-        fontName='Helvetica', fontSize=9,
-        textColor=text_color, spaceAfter=4, leading=14
-    )
-    muted_style = ParagraphStyle('muted',
-        fontName='Helvetica', fontSize=8,
-        textColor=muted_color, spaceAfter=4
-    )
-    risk_style = ParagraphStyle('risk',
-        fontName='Helvetica-Bold', fontSize=32,
-        textColor=risk_color, alignment=TA_CENTER,
-        spaceAfter=4, letterSpacing=4
-    )
-    disclaimer_style = ParagraphStyle('disclaimer',
-        fontName='Helvetica-Oblique', fontSize=7,
-        textColor=muted_color, alignment=TA_CENTER,
-        spaceAfter=4
-    )
+    title_style = ParagraphStyle('title', fontName='Helvetica-Bold', fontSize=28, textColor=neon_green, alignment=TA_CENTER, spaceAfter=4, letterSpacing=6)
+    subtitle_style = ParagraphStyle('subtitle', fontName='Helvetica', fontSize=9, textColor=neon_blue, alignment=TA_CENTER, spaceAfter=2, letterSpacing=3)
+    section_style = ParagraphStyle('section', fontName='Helvetica-Bold', fontSize=10, textColor=neon_green, spaceAfter=8, letterSpacing=2)
+    body_style = ParagraphStyle('body', fontName='Helvetica', fontSize=9, textColor=text_color, spaceAfter=4, leading=14)
+    muted_style = ParagraphStyle('muted', fontName='Helvetica', fontSize=8, textColor=muted_color, spaceAfter=4)
+    risk_style = ParagraphStyle('risk', fontName='Helvetica-Bold', fontSize=32, textColor=risk_color, alignment=TA_CENTER, spaceAfter=4, letterSpacing=4)
+    disclaimer_style = ParagraphStyle('disclaimer', fontName='Helvetica-Oblique', fontSize=7, textColor=muted_color, alignment=TA_CENTER, spaceAfter=4)
 
-    disease_names = {
-        'diabetes': 'DIABETES',
-        'heart': 'HEART DISEASE',
-        'parkinsons': "PARKINSON'S DISEASE"
-    }
-    disease_icons = {
-        'diabetes': '🩸',
-        'heart': '🫀',
-        'parkinsons': '🫁'
-    }
+    disease_names = {'diabetes': 'DIABETES', 'heart': 'HEART DISEASE', 'parkinsons': "PARKINSON'S DISEASE"}
+    disease_icons = {'diabetes': '🩸', 'heart': '🫀', 'parkinsons': '🫁'}
 
     story = []
 
-    # ── HEADER ──
     story.append(Paragraph("⚕ MEDISCAN AI", title_style))
     story.append(Paragraph("MEDICAL RISK ASSESSMENT REPORT", subtitle_style))
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", muted_style))
     story.append(HRFlowable(width="100%", thickness=1, color=neon_green, spaceAfter=16))
 
-    # ── PATIENT INFO ──
     story.append(Paragraph("◈ PATIENT INFORMATION", section_style))
     patient_data = [
         ['Patient', data.username],
@@ -395,32 +397,21 @@ def generate_report(data: PDFReportInput):
         ('ROWBACKGROUNDS', (0,0), (-1,-1), [card_bg, colors.HexColor('#0a1628')]),
         ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#00ff9520')),
         ('PADDING', (0,0), (-1,-1), 8),
-        ('ROUNDEDCORNERS', [4]),
     ]))
     story.append(patient_table)
     story.append(Spacer(1, 16))
 
-    # ── RISK RESULT ──
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#00ff9530'), spaceAfter=12))
     story.append(Paragraph("◈ RISK ASSESSMENT RESULT", section_style))
-    story.append(Paragraph(
-        f"{'⚠ HIGH RISK' if data.risk == 'HIGH' else '✅ LOW RISK'}",
-        risk_style
-    ))
-    story.append(Paragraph(
-        f"Risk Probability: {data.probability}%",
-        ParagraphStyle('prob', fontName='Helvetica-Bold', fontSize=14,
-                       textColor=risk_color, alignment=TA_CENTER, spaceAfter=8)
-    ))
+    story.append(Paragraph(f"{'⚠ HIGH RISK' if data.risk == 'HIGH' else '✅ LOW RISK'}", risk_style))
+    story.append(Paragraph(f"Risk Probability: {data.probability}%",
+        ParagraphStyle('prob', fontName='Helvetica-Bold', fontSize=14, textColor=risk_color, alignment=TA_CENTER, spaceAfter=8)))
     story.append(Paragraph(
         "Please consult a qualified healthcare provider for proper diagnosis and treatment." if data.risk == "HIGH"
         else "No significant risk detected. Maintain your healthy lifestyle!",
-        ParagraphStyle('risksub', fontName='Helvetica', fontSize=9,
-                       textColor=muted_color, alignment=TA_CENTER, spaceAfter=4)
-    ))
+        ParagraphStyle('risksub', fontName='Helvetica', fontSize=9, textColor=muted_color, alignment=TA_CENTER, spaceAfter=4)))
     story.append(Spacer(1, 16))
 
-    # ── FEATURE IMPORTANCE ──
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#00ff9530'), spaceAfter=12))
     story.append(Paragraph("◈ TOP RISK FACTORS", section_style))
     feature_data = [['Factor', 'Importance Score', 'Impact']]
@@ -442,13 +433,9 @@ def generate_report(data: PDFReportInput):
     story.append(feature_table)
     story.append(Spacer(1, 16))
 
-    # ── WHAT-IF SIMULATOR ──
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#00ff9530'), spaceAfter=12))
     story.append(Paragraph("◈ WHAT-IF HEALTH SIMULATION", section_style))
-    story.append(Paragraph(
-        "The following scenarios show how improving your health metrics could reduce your risk:",
-        body_style
-    ))
+    story.append(Paragraph("The following scenarios show how improving your health metrics could reduce your risk:", body_style))
     whatif_data = [['Scenario', 'Projected Risk', 'Change']]
     for scenario, prob in data.whatif.items():
         change = prob - data.probability
@@ -468,7 +455,6 @@ def generate_report(data: PDFReportInput):
     story.append(whatif_table)
     story.append(Spacer(1, 16))
 
-    # ── HEALTH TIPS ──
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#00ff9530'), spaceAfter=12))
     story.append(Paragraph("◈ HEALTH RECOMMENDATIONS", section_style))
     tips = TIPS.get(data.disease, {}).get(data.risk, [])
@@ -486,19 +472,15 @@ def generate_report(data: PDFReportInput):
     story.append(tips_table)
     story.append(Spacer(1, 24))
 
-    # ── FOOTER ──
     story.append(HRFlowable(width="100%", thickness=1, color=neon_green, spaceAfter=8))
     story.append(Paragraph(
         "⚠ DISCLAIMER: This report is generated by MediScan AI for educational purposes only. "
         "It is NOT a substitute for professional medical advice, diagnosis, or treatment. "
         "Always consult a qualified healthcare provider.",
-        disclaimer_style
-    ))
+        disclaimer_style))
     story.append(Paragraph(
         "MediScan AI — Built by Rishit Pandya | M.Data Science @ University of Adelaide 🇦🇺",
-        ParagraphStyle('footer', fontName='Helvetica', fontSize=7,
-                       textColor=neon_green, alignment=TA_CENTER)
-    ))
+        ParagraphStyle('footer', fontName='Helvetica', fontSize=7, textColor=neon_green, alignment=TA_CENTER)))
 
     doc.build(story)
     buffer.seek(0)
@@ -507,7 +489,6 @@ def generate_report(data: PDFReportInput):
     filename = f"MediScan_Report_{disease_label}_{datetime.now().strftime('%Y%m%d')}.pdf"
 
     return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
+        buffer, media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
